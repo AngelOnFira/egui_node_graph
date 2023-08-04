@@ -118,6 +118,7 @@ pub struct MyGraphState {
     pub web_server: HashMap<NodeId, Route>,
 }
 
+#[derive(Debug)]
 pub struct Route {
     pub path: String,
 }
@@ -521,6 +522,14 @@ impl eframe::App for NodeGraphExample {
                 self.user_state.active_node = None;
             }
         }
+
+        ctx.debug_painter().text(
+            egui::pos2(10.0, 65.0),
+            egui::Align2::LEFT_TOP,
+            format!("Routes: {:?}", self.user_state.web_server),
+            TextStyle::Button.resolve(&ctx.style()),
+            egui::Color32::WHITE,
+        );
     }
 }
 
