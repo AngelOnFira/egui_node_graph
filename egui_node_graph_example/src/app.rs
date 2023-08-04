@@ -9,6 +9,7 @@ use egui_node_graph::*;
 /// store additional information that doesn't live in parameters. For this
 /// example, the node data stores the template (i.e. the "type") of the node.
 #[cfg_attr(feature = "persistence", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug)]
 pub struct MyNodeData {
     template: MyNodeTemplate,
 }
@@ -21,6 +22,7 @@ pub struct MyNodeData {
 pub enum MyDataType {
     Scalar,
     Vec2,
+    Route,
 }
 
 /// In the graph, input parameters can optionally have a constant value. This
@@ -30,11 +32,13 @@ pub enum MyDataType {
 /// this library makes no attempt to check this consistency. For instance, it is
 /// up to the user code in this example to make sure no parameter is created
 /// with a DataType of Scalar and a ValueType of Vec2.
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug)]
 #[cfg_attr(feature = "persistence", derive(serde::Serialize, serde::Deserialize))]
 pub enum MyValueType {
     Vec2 { value: egui::Vec2 },
     Scalar { value: f32 },
+    Route { path: String },
+    Server,
 }
 
 impl Default for MyValueType {
@@ -63,6 +67,15 @@ impl MyValueType {
             anyhow::bail!("Invalid cast from {:?} to scalar", self)
         }
     }
+
+    /// Tries to downcast this value type to a route
+    pub fn try_to_route(self) -> anyhow::Result<String> {
+        if let MyValueType::Route { path } = self {
+            Ok(path)
+        } else {
+            anyhow::bail!("Invalid cast from {:?} to route", self)
+        }
+    }
 }
 
 /// NodeTemplate is a mechanism to define node templates. It's what the graph
@@ -70,6 +83,7 @@ impl MyValueType {
 /// library how to convert a NodeTemplate into a Node.
 #[derive(Clone, Copy)]
 #[cfg_attr(feature = "persistence", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug)]
 pub enum MyNodeTemplate {
     MakeScalar,
     AddScalar,
@@ -78,6 +92,10 @@ pub enum MyNodeTemplate {
     AddVector,
     SubtractVector,
     VectorTimesScalar,
+    // Web server items
+    Server,
+    Route,
+
 }
 
 /// The response type is used to encode side-effects produced when drawing a
@@ -97,6 +115,11 @@ pub enum MyResponse {
 #[cfg_attr(feature = "persistence", derive(serde::Serialize, serde::Deserialize))]
 pub struct MyGraphState {
     pub active_node: Option<NodeId>,
+    pub web_server: HashMap<NodeId, Route>,
+}
+
+pub struct Route {
+    pub path: String,
 }
 
 // =========== Then, you need to implement some traits ============
@@ -107,6 +130,7 @@ impl DataTypeTrait<MyGraphState> for MyDataType {
         match self {
             MyDataType::Scalar => egui::Color32::from_rgb(38, 109, 211),
             MyDataType::Vec2 => egui::Color32::from_rgb(238, 207, 109),
+            MyDataType::Route => egui::Color32::from_rgb(109, 238, 109),
         }
     }
 
@@ -114,6 +138,7 @@ impl DataTypeTrait<MyGraphState> for MyDataType {
         match self {
             MyDataType::Scalar => Cow::Borrowed("scalar"),
             MyDataType::Vec2 => Cow::Borrowed("2d vector"),
+            MyDataType::Route => Cow::Borrowed("route"),
         }
     }
 }
@@ -136,6 +161,8 @@ impl NodeTemplateTrait for MyNodeTemplate {
             MyNodeTemplate::AddVector => "Vector add",
             MyNodeTemplate::SubtractVector => "Vector subtract",
             MyNodeTemplate::VectorTimesScalar => "Vector times scalar",
+            MyNodeTemplate::Route => "Route",
+            MyNodeTemplate::Server => "Server",
         })
     }
 
@@ -149,6 +176,8 @@ impl NodeTemplateTrait for MyNodeTemplate {
             | MyNodeTemplate::AddVector
             | MyNodeTemplate::SubtractVector => vec!["Vector"],
             MyNodeTemplate::VectorTimesScalar => vec!["Vector", "Scalar"],
+            MyNodeTemplate::Route | MyNodeTemplate::Server => vec!["Web"],
+
         }
     }
 
@@ -196,11 +225,28 @@ impl NodeTemplateTrait for MyNodeTemplate {
             );
         };
 
+        let input_route = |graph: &mut MyGraph, name: &str| {
+            graph.add_input_param(
+                node_id,
+                name.to_string(),
+                MyDataType::Route,
+                MyValueType::Route {
+                    path: String::new(),
+                },
+                InputParamKind::ConnectionOrConstant,
+                true,
+            );
+        };
+
         let output_scalar = |graph: &mut MyGraph, name: &str| {
             graph.add_output_param(node_id, name.to_string(), MyDataType::Scalar);
         };
         let output_vector = |graph: &mut MyGraph, name: &str| {
             graph.add_output_param(node_id, name.to_string(), MyDataType::Vec2);
+        };
+
+        let output_route = |graph: &mut MyGraph, name: &str| {
+            graph.add_output_param(node_id, name.to_string(), MyDataType::Route);
         };
 
         match self {
@@ -254,6 +300,13 @@ impl NodeTemplateTrait for MyNodeTemplate {
                 input_scalar(graph, "value");
                 output_scalar(graph, "out");
             }
+            MyNodeTemplate::Route => {
+                input_route(graph, "path");
+                output_route(graph, "out");
+            }
+            MyNodeTemplate::Server => {
+                output_route(graph, "routes");
+            }
         }
     }
 }
@@ -274,6 +327,7 @@ impl NodeTemplateIter for AllMyNodeTemplates {
             MyNodeTemplate::AddVector,
             MyNodeTemplate::SubtractVector,
             MyNodeTemplate::VectorTimesScalar,
+            MyNodeTemplate::Route,
         ]
     }
 }
@@ -306,6 +360,18 @@ impl WidgetValueTrait for MyValueType {
                 ui.horizontal(|ui| {
                     ui.label(param_name);
                     ui.add(DragValue::new(value));
+                });
+            }
+            MyValueType::Route { path } => {
+                ui.horizontal(|ui| {
+                    ui.label(param_name);
+                    // ui.add(DragValue::new(value));
+                    ui.add(egui::TextEdit::singleline(path));
+                });
+            }
+            MyValueType::Server => {
+                ui.horizontal(|ui| {
+                    ui.label(param_name);
                 });
             }
         }
@@ -426,6 +492,7 @@ impl eframe::App for NodeGraphExample {
             })
             .inner;
         for node_response in graph_response.node_responses {
+            dbg!(&node_response);
             // Here, we ignore all other graph events. But you may find
             // some use for them. For example, by playing a sound when a new
             // connection is created
@@ -514,11 +581,20 @@ pub fn evaluate_node(
         fn input_scalar(&mut self, name: &str) -> anyhow::Result<f32> {
             self.evaluate_input(name)?.try_to_scalar()
         }
+        fn input_path(&mut self, name: &str) -> anyhow::Result<String> {
+            self.evaluate_input(name)?.try_to_route()
+        }
         fn output_vector(&mut self, name: &str, value: egui::Vec2) -> anyhow::Result<MyValueType> {
             self.populate_output(name, MyValueType::Vec2 { value })
         }
         fn output_scalar(&mut self, name: &str, value: f32) -> anyhow::Result<MyValueType> {
             self.populate_output(name, MyValueType::Scalar { value })
+        }
+        fn output_path(&mut self, name: &str, value: String) -> anyhow::Result<MyValueType> {
+            self.populate_output(name, MyValueType::Route { path: value })
+        }
+        fn output_server(&mut self, name: &str) -> anyhow::Result<MyValueType> {
+            self.populate_output(name, MyValueType::Server)
         }
     }
 
@@ -559,6 +635,13 @@ pub fn evaluate_node(
             let value = evaluator.input_scalar("value")?;
             evaluator.output_scalar("out", value)
         }
+        MyNodeTemplate::Route => {
+            let value = evaluator.input_path("path")?;
+            evaluator.output_path("out", value)
+        }
+        MyNodeTemplate::Server => {
+            evaluator.output_server("routes")
+        }
     }
 }
 
@@ -570,8 +653,8 @@ fn populate_output(
     value: MyValueType,
 ) -> anyhow::Result<MyValueType> {
     let output_id = graph[node_id].get_output(param_name)?;
-    outputs_cache.insert(output_id, value);
-    Ok(value)
+    outputs_cache.insert(output_id, value.clone());
+    Ok(value.clone())
 }
 
 // Evaluates the input value of
@@ -588,7 +671,7 @@ fn evaluate_input(
         // The value was already computed due to the evaluation of some other
         // node. We simply return value from the cache.
         if let Some(other_value) = outputs_cache.get(&other_output_id) {
-            Ok(*other_value)
+            Ok(other_value.clone())
         }
         // This is the first time encountering this node, so we need to
         // recursively evaluate it.
@@ -597,13 +680,14 @@ fn evaluate_input(
             evaluate_node(graph, graph[other_output_id].node, outputs_cache)?;
 
             // Now that we know the value is cached, return it
-            Ok(*outputs_cache
+            Ok(outputs_cache
                 .get(&other_output_id)
-                .expect("Cache should be populated"))
+                .expect("Cache should be populated")
+                .clone())
         }
     }
     // No existing connection, take the inline value instead.
     else {
-        Ok(graph[input_id].value)
+        Ok(graph[input_id].value.clone())
     }
 }
